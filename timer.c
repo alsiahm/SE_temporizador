@@ -234,4 +234,17 @@ void timer_set_periodic(uint32_t u_seg, void (*ptFuncion)(void)) {
   unlock();
 }
 
-
+// Función para detener la ejecución periódica configurada con timer_set_periodic
+// Si no hay ninguna función periódica activa no hace nada (así no se cancela
+// un posible timeout pendiente)
+void timer_stop_periodic(void) {
+  lock(); // Bloquear las interrupciones
+  if (tiempo_periodico > 0) {
+    _io_ports[M6812_TMSK1] &= ~M6812B_C2I; // Deshabilitar la interrupción canal OC2
+    _io_ports[M6812_TFLG1] = M6812B_C2F;   // Limpiar la bandera del canal OC2
+    tiempo_periodico = 0;   // Ya no hay función periódica
+    vueltas_pendientes = 0; // Descartar vueltas pendientes
+    punteroFuncion = 0;     // Ninguna función pendiente de ejecutar
+  }
+  unlock(); // Volver a habilitar las interrupciones
+}

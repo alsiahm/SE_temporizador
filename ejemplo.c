@@ -38,8 +38,15 @@ int main(void) {
     timer_set_periodic(5000000, mensaje_periodico);
 
     /* 6. Mantener el programa funcionando */
+    serial_print("\r\nPulsa cualquier tecla para detener el evento periodico\n");
     while (1) {
         /* El temporizador trabaja mediante interrupciones */
+        /* 7. Si se recibe un caracter por el puerto serie, parar el periodico */
+        if (serial_receive_pending()) {
+            serial_get(); /* Leer (y descartar) el caracter recibido */
+            timer_stop_periodic();
+            serial_print("\r\nEvento periodico detenido\n");
+        }
     }
 
     return 0;
