@@ -22,4 +22,6 @@ void timer_set_timeout(uint32_t u_seg, void (*ptFuncion)(void));
 
 void timer_set_periodic(uint32_t u_seg, void (*ptFuncion)(void));
 
+void timer_stop_periodic(void);
+
 #endif //TIMER_H
