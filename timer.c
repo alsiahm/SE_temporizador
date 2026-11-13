@@ -292,7 +292,6 @@ void timer_set_timeout(uint32_t u_seg, void (*ptFuncion)(void)) {
 
   // Calcular cuándo se debe ejecutar  
   tiempo_inicio = timer_get_ticks() + time_out;
-  serial_print("\r\nantes del lock");
 
   // Bloquear las interrupciones
   lock();
