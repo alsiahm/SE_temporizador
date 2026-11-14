@@ -82,12 +82,6 @@ static uint16_t vueltas_pendientes[8]; // Número de vueltas pendientes para cad
 static void (*funciones[8])(void); // Punteros a las funciones de usuario para cada canal
 // Si el valor es 0, el canal está libre
 
-// Variables para el manejo de la función de usuario
-// Guarda el instante en el que se debe ejecutar
-static uint32_t tiempo_inicio = 0;
-
-// Puntero a la función que se ejecutará
-void (*punteroFuncion)(void);
 
 // Variables globales para el contador absoluto del temporizador
 // Contador absoluto del temporizador que incrementa con cada tick
@@ -114,9 +108,9 @@ void __attribute__((interrupt)) vi_tov(void) {
  * @brief Función de búsqueda de canal libre (como cola)
  * Busca el primer canal OC libre (sin función asignada) y devuelve su índice
  * Debe llamarse con las interrupciones bloqueadas
- * @return int: Devuelve el índice del canal libre (0-7) o -
+ * @return int8_t: Devuelve el índice del canal libre (0-7) o -1
  */
-uint8_t buscar_canal_libre(void) {
+int8_t buscar_canal_libre(void) {
   for (uint8_t i = 0; i < 8; i++) {
     if (funciones[i] == NULL) {
       return i; // Canal libre encontrado
@@ -187,40 +181,38 @@ void atender_canal(uint8_t canal) {
 
   // Si es periódica, configurar el siguiente tiempo de ejecución
   if (periodos[canal] > 0) {
-    programar_canal(canal, _IO_PORTS_W(M6812_TCNT), periodos[canal]);
+    programar_canal(canal, _IO_PORTS_W(registro_TC[canal]), periodos[canal]);
   } else {
     // Si es una función de timeout, desactivar la interrupción del canal OCn
     liberar_canal(canal);
   }
 
-  if (funcionEjecutar) {
-    funcionEjecutar(); // Ejecutar la función de usuario
-  }
+  funcionEjecutar(); // Ejecutar la función de usuario
 }
 
 // Interrupciones de todos los canales OCn (0-7)
-void __attribute__((interrupt)) vi_oc0(void) {
+void __attribute__((interrupt)) vi_ioc0(void) {
   atender_canal(0); // Canal OC0
 }
-void __attribute__((interrupt)) vi_oc1(void) {
+void __attribute__((interrupt)) vi_ioc1(void) {
   atender_canal(1); // Canal OC1
 }
-void __attribute__((interrupt)) vi_oc2(void) {
+void __attribute__((interrupt)) vi_ioc2(void) {
   atender_canal(2); // Canal OC2
 }
-void __attribute__((interrupt)) vi_oc3(void) {
+void __attribute__((interrupt)) vi_ioc3(void) {
   atender_canal(3); // Canal OC3
 }
-void __attribute__((interrupt)) vi_oc4(void) {
+void __attribute__((interrupt)) vi_ioc4(void) {
   atender_canal(4); // Canal OC4
 }
-void __attribute__((interrupt)) vi_oc5(void) {
+void __attribute__((interrupt)) vi_ioc5(void) {
   atender_canal(5); // Canal OC5
 }
-void __attribute__((interrupt)) vi_oc6(void) {
+void __attribute__((interrupt)) vi_ioc6(void) {
   atender_canal(6); // Canal OC6
 }
-void __attribute__((interrupt)) vi_oc7(void) {
+void __attribute__((interrupt)) vi_ioc7(void) {
   atender_canal(7); // Canal OC7
 }
 
@@ -259,7 +251,7 @@ void timer_init(void) {
   // Configuración de los 8 canales
   _io_ports[M6812_TMSK1] = 0;
   _io_ports[M6812_TFLG1] = 0xFF; // Limpiar todas las banderas de los canales
-  _io_ports[M6812_TCTL1] = 0; // Configurar todos los canales como entrada (libres)
+  _io_ports[M6812_TCTL1] = 0; // el disparo no modifica ningún pin
   _io_ports[M6812_TCTL2] = 0; // Configurar todos los canales como entrada (libres)
   _io_ports[M6812_OC7M] = 0; // Configurar todos los canales como entrada (libres)
   
@@ -395,26 +387,27 @@ int8_t iniciar_canal(uint32_t ticks, uint32_t periodo, void (*ptFuncion)(void)) 
  * @param u_seg
  * @param ptFuncion
  */
-void timer_set_timeout(uint32_t u_seg, void (*ptFuncion)(void)) {
+int8_t timer_set_timeout(uint32_t u_seg, void (*ptFuncion)(void)) {
   uint32_t ticks = usg_2_ticks(u_seg); // Convertir microsegundos a ticks
-  iniciar_canal(ticks, 0, ptFuncion); // Iniciar un canal con periodo 0 (timeout)
+  return iniciar_canal(ticks, 0, ptFuncion); // Iniciar un canal con periodo 0 (timeout)
 }
 
 
 /**
- * @brief
+ * @brief Función para configurar un temporizador que ejecute una función 
+ *        periódicamente
  * @param u_seg
  * @param ptFuncion
  */
-void timer_set_periodic(uint32_t u_seg, void (*ptFuncion)(void)) {
+int8_t timer_set_periodic(uint32_t u_seg, void (*ptFuncion)(void)) {
   uint32_t ticks = usg_2_ticks(u_seg); // Convertir microsegundos a ticks
-  iniciar_canal(ticks, ticks, ptFuncion); // Iniciar un canal con periodo igual al tiempo de disparo (periódico)
+  return iniciar_canal(ticks, ticks, ptFuncion); // Iniciar un canal con periodo igual al tiempo de disparo (periódico)
 }
 
 
 /**
- * @brief Función para detener la ejecución periódica configurada con 
- *        timer_set_periodic Si no hay ninguna función periódica activa 
+ * @brief Función para detener la ejecución  configurada con 
+ *         Si no hay ninguna función periódica activa 
  *        no hace nada (así no se cancela un posible timeout pendiente)
  */
 void timer_stop(uint8_t canal) {
