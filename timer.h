@@ -18,12 +18,11 @@
   Si M6812_CPU_E_CLOCK tiene otro valor la compilación se detiene con un error
 
   Recursos que utiliza:
-  - Los canales 0 a 3 del temporizador (OC0 a OC3) como comparadores de
+  - Los canales 0 a 7 del temporizador (OC0 a OC7) como comparadores de
     salida, con sus interrupciones.
-  - Los canales 4 a 7 no se utilizan y quedan libres para otros usos.
 
   Cada función de timeout o periódica activa ocupa un canal, por lo que
-  se pueden tener simultáneamente hasta TIMER_NUM_CANALES (4 por defecto)
+  se pueden tener simultáneamente hasta TIMER_NUM_CANALES (8 por defecto)
   entre ambos tipos, en cualquier combinación.
 
   Resolución y alcance
@@ -32,9 +31,8 @@
 
   El alcance es el tiempo máximo que se puede medir o programar: pasado ese
   tiempo timer_get_ticks(), timer_get_us() y timer_get_ms() vuelven a
-  empezar desde 0. Los retrasos mayores que el alcance se recortan a éste
-  (salvo en timer_sleep_ms(), que no tiene esa limitación).
-
+  empezar desde 0. Los retrasos no pueden superar el alcance y, si lo hacen,
+  el resultado sería incorrecto.
   El retraso mínimo de las funciones de timeout y periódicas es de unos
   64 usg (512 ciclos del reloj E): los valores menores se aumentan
   hasta ese mínimo.
@@ -43,7 +41,7 @@
 /** Número de canales del temporizador que utiliza la librería.
 
     Es también el máximo de funciones de timeout y periódicas que puede
-    haber a la vez. Por defecto se usan los canales del 0 al 3.
+    haber a la vez. Por defecto se usan los canales del 0 al 7.
 */
 #define TIMER_NUM_CANALES 8
 
@@ -102,9 +100,8 @@ uint32_t timer_get_ms(void);
 void timer_sleep_us(uint32_t useg);
 
 /*  Espera activa del número de milisegundos indicado.
-
     Se apoya en timer_sleep_us() para no perder resolución.
-
+    Como máximo 536870 ms (unos 9 minutos), sea cual sea el factor.
     @param mseg milisegundos a esperar.
 */
 void timer_sleep_ms(uint32_t mseg);

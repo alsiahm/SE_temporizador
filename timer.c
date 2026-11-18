@@ -61,11 +61,7 @@ static uint16_t margen_ticks;
    Si no cabe en 32 bits devuelve el máximo */
 static uint32_t usg_2_ticks(uint32_t useg) {
   if (factor_tcm <= 3) {
-    uint8_t desplaza = 3 - factor_tcm;
-    if (useg > (0xFFFFFFFFUL >> desplaza))
-      /* UL como unsigned long  */
-      return 0xFFFFFFFFUL;
-    return useg << desplaza;
+    return useg << (3 - factor_tcm);
   }
   return useg >> (factor_tcm - 3);
 }
@@ -81,10 +77,10 @@ static uint32_t ticks_2_usg(uint32_t ticks) {
 /*  Cuenta de tiempo  */
 
 /* Vueltas completas que ha dado TCNT. Se modifica SOLO en vi_tov (y se
-   pone a 0 en timer_init). Es volatile porque cambia en una interrupción */
+   pone a 0 en timer_init). Es volatile porque cambia en una interrupción. */
 static volatile uint16_t numero_vueltas;
 
-/* Valor de TCNT en el momento de timer_init: origen de tiempos */
+/* Valor de TCNT en el momento de timer_init: origen de tiempo.*/
 static uint16_t tcnt_inicio;
 
 /* Interrupción de desbordamiento: TCNT pasa de 0xFFFF a 0x0000 */
@@ -140,12 +136,6 @@ void timer_sleep_us(uint32_t useg) {
 }
 
 void timer_sleep_ms(uint32_t mseg) {
-  /* Se espera en tramos de 1 minuto para que los microsegundos (y los
-     ticks) quepan en 32 bits sea cual sea el valor pedido */
-  while (mseg > 60000UL) {
-    timer_sleep_us(60000UL * 1000UL);
-    mseg -= 60000UL;
-  }
   timer_sleep_us(mseg * 1000UL);
 }
 
@@ -202,12 +192,6 @@ static void atiende_canal(uint8_t n) {
 
   /* Bajamos el banderín del canal */
   _io_ports[M6812_TFLG1] = TIMER_BIT(n);
-
-  if (!funcion) {
-    /* No debería ocurrir: canal libre con la interrupción habilitada */
-    _io_ports[M6812_TMSK1] &= (uint8_t)~TIMER_BIT(n);
-    return;
-  }
 
   if (ticks_restantes[n]) {
     /* Aún no ha pasado todo el tiempo: siguiente tramo */
