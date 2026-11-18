@@ -1,382 +1,403 @@
+/* timer.c -- Librería de temporización para el 68HC12 (placa ADAPT912DT60)
 
-/**
- * LIBRERÍA EN C PARA EL USO DE TEMPORIZACIÓN EN EL MICROCONTROLADOR
- * Autores: Alba Hidalgo Martín, Xuan Sun, Juhi Kamal Chatani Mansukhani
- */
+   Autores: Alba Hidalgo Martín, Xuan Sun, Juhi Kamal Chatani Mansukhani
+
+   ATENCIÓN: esta librería SOLO ES VÁLIDA SI EL RELOJ E VA A 8MHz
+
+   La documentación de las funciones públicas está en timer.h
+*/
+
+#include <sys/param.h>
+#include <sys/ports.h>
+#include <sys/interrupts.h>
+#include <sys/locks.h>
 #include "timer.h"
 
-/** EXPLICACIÓN DE PATILLAS/BANDERINES DEL TEMPORIZADOR
- * TCNT: Contador del temporizador, incrementa cada tick del temporizador
- * TOF: Bandera de vueltas temporizador, se activa cuando TCNT desborda
- * TOI: Interrupción de vueltas del temporizador, se activa cuando TOF
- * TC2: Registro de comparación del canal OC2, se configura con el valor de
- *      TC
- * OC2: Canal de salida temporizador, activa cuando TCNT coincide con valor
- *      TC2
- * TFLG2: Registro de banderas del temporizador, contiene la bandera TOF
- * TFLG1: Registro de banderas del temporizador, contiene la bandera C2
- * C2F: Bandera de coincidencia canal OC2, activa cuando TCNT coincide con 
- *      TC2
- * C2I: Interrupción del canal OC2, se activa cuando C2F
- * No se usará el IC2 (canal de entrada) ni el OC1 (canal de salida 1)
+#if M6812_CPU_E_CLOCK != 8000000
+# error "timer: código solo válido si el reloj E va a 8MHz"
+#endif
+
+#if (TIMER_NUM_CANALES < 1) || (TIMER_NUM_CANALES > 8)
+# error "timer: TIMER_NUM_CANALES debe estar entre 1 y 8"
+#endif
+
+/* Registros y banderines utilizados
+ *  TCNT:  contador del temporizador, se incrementa con cada tick
+ *  TMSK2: factor de división (PR2:PR0), interrupción de desbordamiento (TOI)
+ *  TFLG2: banderín de desbordamiento de TCNT (TOF)
+ *  TCTL2: acción sobre el pin de los canales 0 a 3 (OMn, OLn)
+ *  TCTL1: acción sobre el pin de los canales 4 a 7 (OMn, OLn)
+ *  TIOS:  selecciona cada canal como comparador de salida (IOSn)
+ *  TCn:   registro de comparación del canal n
+ *  TMSK1: habilita la interrupción de cada canal (CnI)
+ *  TFLG1: banderín de coincidencia de cada canal (CnF)
  */
 
-/*Factor de escalado de 0 a 7*/
-uint8_t TCM_FACTOR;
+/* Registro de comparación (16 bits) del canal n */
+#define TIMER_TC(n) _IO_PORTS_W(M6812_TC0 + ((n) << 1))
 
-/**
- * @brief Función para pasar de microsegundos a ticks en base al factor
- * @param useg
- * @return uint32_t
- */
-uint32_t usg_2_ticks(uint32_t useg) {
-  if (TCM_FACTOR <= 3)
-  // Pasa de microsegundos a ticks
-    return useg << (3 - TCM_FACTOR); 
-  else 
-  // Pasa de microsegundos a ticks
-    return useg >> (TCM_FACTOR - 3); 
+/* Bit del canal n en TIOS, TMSK1 y TFLG1 */
+#define TIMER_BIT(n) ((uint8_t)(1 << (n)))
+
+/* Bits en TIOS, TMSK1 y TFLG1 de todos los canales que usa la librería */
+#define TIMER_BITS_CANALES ((uint8_t)((1U << TIMER_NUM_CANALES) - 1))
+
+/* Ciclos de reloj E mínimos entre que se programa un disparo y éste se
+   produce. Debe ser mayor que lo que se tarda en entrar en la rutina de
+   interrupción y reprogramar el canal: si no, la coincidencia se perdería
+   y el disparo se retrasaría una vuelta entera de TCNT */
+#define TIMER_MARGEN_CICLOS 512
+
+
+/* Conversión de unidades */
+
+/* Factor de división del temporizador (de 0 a 7) fijado en timer_init */
+static uint8_t factor_tcm;
+
+/* Ticks mínimos de un tramo de espera (TIMER_MARGEN_CICLOS en ticks) */
+static uint16_t margen_ticks;
+
+/* Pasa de microsegundos a ticks según el factor de división.
+   Si no cabe en 32 bits devuelve el máximo */
+static uint32_t usg_2_ticks(uint32_t useg) {
+  if (factor_tcm <= 3) {
+    uint8_t desplaza = 3 - factor_tcm;
+    if (useg > (0xFFFFFFFFUL >> desplaza))
+      /* UL como unsigned long  */
+      return 0xFFFFFFFFUL;
+    return useg << desplaza;
+  }
+  return useg >> (factor_tcm - 3);
 }
 
-/**
- * @brief Función para pasar de milisegundos a ticks
- * @param mseg
- * @return uint32_t
- */
-uint32_t msg_2_ticks(uint32_t mseg) {
-  // Pasa de milisegundos a ticks
-  return usg_2_ticks(mseg * 1000); 
+/* Pasa de ticks a microsegundos según el factor de división */
+static uint32_t ticks_2_usg(uint32_t ticks) {
+  if (factor_tcm <= 3)
+    return ticks >> (3 - factor_tcm);
+  return ticks << (factor_tcm - 3);
 }
 
-/**
- * @brief Función para pasar de ticks a microsegundos
- * @param ticks
- * @return uint32_t
- */
-uint32_t ticks_2_usg(uint32_t ticks) {
-  if (TCM_FACTOR <= 3) 
-    // Pasa de ticks a microsegundos
-    return ticks >> (3 - TCM_FACTOR);
-  else 
-    return ticks << (TCM_FACTOR - 3); 
-}
 
-/**
- * @brief Función para pasar de ticks a milisegundos
- * @param ticks
- * @return uint32_t
- */
-uint32_t ticks_2_msg(uint32_t ticks) {
-  // Pasa de ticks a milisegundos
-  return ticks_2_usg(ticks) / 1000;
-}
+/*  Cuenta de tiempo  */
 
-// Variables para el manejo de la función de usuario
-// Guarda el instante en el que se debe ejecutar
-static uint32_t tiempo_inicio = 0;
+/* Vueltas completas que ha dado TCNT. Se modifica SOLO en vi_tov (y se
+   pone a 0 en timer_init). Es volatile porque cambia en una interrupción */
+static volatile uint16_t numero_vueltas;
 
-// Puntero a la función que se ejecutará
-void (*punteroFuncion)(void);
+/* Valor de TCNT en el momento de timer_init: origen de tiempos */
+static uint16_t tcnt_inicio;
 
-// Variables globales para el contador absoluto del temporizador
-// Contador absoluto del temporizador que incrementa con cada tick
-static uint32_t contador_absoluto = 0;
-
-// Volatile indica que esta variable puede cambiar fuera del flujo normal
-// del programa, por ejemplo, desde una interrupción
-// Contador de vueltas
-volatile uint16_t numero_vueltas = 0;
-
-// Contador de vueltas pendientes que incrementa con cada vuelta del 
-// temporizador
-volatile uint16_t vueltas_pendientes = 0;
-
-// Variables para función periódica
-// Guarda el periodo en milisegundos para la función periódica
-static uint32_t tiempo_periodico = 0;
-
-/**
- * @brief Función activada por interrupción de desbordamiento que actualiza
- *        el número de desbordamientos
- * @param
- */
+/* Interrupción de desbordamiento: TCNT pasa de 0xFFFF a 0x0000 */
 void __attribute__((interrupt)) vi_tov(void) {
   numero_vueltas++;
-  // Limpiar la bandera TOF del registro TFLG2  (desbordamiento)
+  /* Bajamos el banderín de desbordamiento */
   _io_ports[M6812_TFLG2] = M6812B_TOF;
 }
 
-/**
- * @brief Función activada por interrupción del OC2 que ejecuta la función
- *        indicada
- * @param
- */
-void __attribute__((interrupt)) vi_ioc2(void) {
-  // Limpiar la bandera de interrupción del canal OC2
-  _io_ports[M6812_TFLG1] = M6812B_C2F;
-
-  // Guardar la función a ejecutar
-  void (*funcionEjecutar)(void) = punteroFuncion; 
-
-  // Si hay vueltas pendientes, no ejecutar la función aún
-  if(vueltas_pendientes > 0){
-    vueltas_pendientes--;
-    return;
-  }
-
-  // Si es periódica, configurar el siguiente tiempo de ejecución
-  if (tiempo_periodico > 0) { 
-    tiempo_inicio += tiempo_periodico;
-    // Configurar el tiempo de disparo. TC2 tiene 16 bits, por lo que se 
-    // usan los 16 bits menos significativos de tiempo_inicio.
-    _IO_PORTS_W(M6812_TC2) += tiempo_periodico & 0xFFFF;   
-
-    // Guardar el número de vueltas pendientes
-    vueltas_pendientes = tiempo_periodico >> 16;
-  } else {
-    // Si es una función de timeout, desactivar la interrupción del canal 
-    // OC2
-    _io_ports[M6812_TMSK1] &= ~M6812B_C2I;
-
-    // Indicar que ya no hay ninguna función pendiente
-    punteroFuncion = 0;
-  }
-  if (funcionEjecutar) {
-    // Ejecutar la función de usuario
-    funcionEjecutar();
-  }
-}
-
-
-/**
- * @brief Función para iniciar el temporizador
- * @param
- */
-void timer_init(void) {
-  // Bloquear las interrupciones
-  lock();
-
-  // Configurar el factor de preescala del temporizador
-	// Factor de escalado de 0 a 7
-	TCM_FACTOR = _io_ports[M6812_TMSK2] & 0x07;
-  
-  // Desactivar el reset del contador con OC7
-  _io_ports[M6812_TMSK2] &= ~M6812B_TCRE;
-
-  // Desactivar el borrado automático de las banderas
-  _io_ports[M6812_TSCR] &= ~M6812B_TFFCA;
-
-  // Inicializar el número de vueltas
-  numero_vueltas = 0;
-
-  // Limpiar la bandera de desbordamiento
-  _io_ports[M6812_TFLG2] = M6812B_TOF;
-
-  // Activar la interrupción de desbordamiento
-  _io_ports[M6812_TMSK2] |= M6812B_TOI;
-
-  // Activar el temporizador
-  _io_ports[M6812_TSCR] |= M6812B_TEN;
-
-  // Configurar el canal OC2 como salida
-  _io_ports[M6812_TIOS] |= M6812B_IOS2;
-
-  // Desactivar la interrupción del canal OC2
-  _io_ports[M6812_TMSK1] &= ~M6812B_C2I;
-
-  // Limpiar la bandera del canal OC2
-  _io_ports[M6812_TFLG1] = M6812B_C2F;
-
-  // Habilitar las interrupciones
-  unlock();
-}
-
-
-/**
- * @brief Función para obtener el valor del contador absoluto del 
- *        temporizador
- * @param
- * @return
- */
 uint32_t timer_get_ticks(void) {
-  // Bloquear las interrupciones
-  lock();
+  uint16_t vueltas;
+  uint16_t contador;
+  /* Se guarda y restaura la máscara de interrupciones (en lugar de
+     lock/unlock) para poder invocarla con las interrupciones enmascaradas */
+  unsigned short mascara = lock();
 
-  // Guardar el número de vueltas
-  uint32_t vueltas = numero_vueltas;
-
-  // Guardar el contador actual, por si hay una vuelta pendiente
-  uint32_t contador = _IO_PORTS_W(M6812_TCNT);
-  
-  // Comprobar si hay una vuelta pendiente
-  // Puede que TCNT haya dado una vuelta sin que se haya ejecutado la
-  // interrupción.
+  vueltas = numero_vueltas;
+  contador = _IO_PORTS_W(M6812_TCNT);
+  /* Puede que TCNT haya desbordado y aún no se haya atendido vi_tov.
+     En ese caso contamos la vuelta en la copia local (numero_vueltas la
+     actualizará vi_tov) y volvemos a leer TCNT, ya que no sabemos si la
+     lectura anterior fue antes o después del desbordamiento */
   if (_io_ports[M6812_TFLG2] & M6812B_TOF) {
     vueltas++;
-
-    // Limpiar la bandera para que no se vuelva a contar
-    _io_ports[M6812_TFLG2] = M6812B_TOF;
-
-    // Actualizar el contador absoluto con el valor actual de TCNT
     contador = _IO_PORTS_W(M6812_TCNT);
-
-    // Actualizar el número de vueltas
-    numero_vueltas = vueltas;
   }
 
-  // Calcular el contador absoluto: 16 bits superiores para las vueltas y
-  // 16 bits inferiores para el valor del contador.
-  contador_absoluto = (vueltas << 16) | contador;
+  /* Es como un unlock solo si antes estaba unlocked. Habilita la interrupcion
+  si estaban habilitadas */
+  restore(mascara);
 
-  // Volver a habilitar las interrupciones
-  unlock();
-
-  // Devolver el valor del contador absoluto
-  return contador_absoluto;
+  /* 16 bits izq: vueltas, 16 bits bajderos: TCNT. Se resta el origen */
+  return (((uint32_t)vueltas << 16) | contador) - tcnt_inicio;
 }
 
-
-/**
- * @brief Función para obtener el tiempo transcurrido en microsegundos 
- *        desde que se inició el temporizador
- * @return uint32_t: Devuelve el tiempo en microsegundos
- */
 uint32_t timer_get_us(void) {
   return ticks_2_usg(timer_get_ticks());
 }
 
-
-/**
- * @brief Función para obtener el tiempo transcurrido en milisegundos
- *        desde que se inició el temporizador
- * @return uint32_t: Devuelve el tiempo en milisegundos
- */
 uint32_t timer_get_ms(void) {
-  return ticks_2_msg(timer_get_ticks());
+  return timer_get_us() / 1000;
 }
 
 
-/**
- * @brief Función que espera una cantidad de tiempo indicada sin hacer nada
- * @param milisegundos a esperar
- */
-void timer_sleep_ms(uint32_t milisegundos) {
-  // Guardar el tiempo inicial
-  uint32_t inicio = timer_get_ms();
+/*  Esperas  */
 
-  // Esperar hasta que pase el tiempo indicado
-  while (timer_get_ms() - inicio < milisegundos);
+void timer_sleep_us(uint32_t useg) {
+  uint32_t ticks = usg_2_ticks(useg);
+  uint32_t inicio = timer_get_ticks();
+
+  /* La resta sin signo es correcta aunque el contador de ticks desborde */
+  while ((timer_get_ticks() - inicio) < ticks);
+}
+
+void timer_sleep_ms(uint32_t mseg) {
+  /* Se espera en tramos de 1 minuto para que los microsegundos (y los
+     ticks) quepan en 32 bits sea cual sea el valor pedido */
+  while (mseg > 60000UL) {
+    timer_sleep_us(60000UL * 1000UL);
+    mseg -= 60000UL;
+  }
+  timer_sleep_us(mseg * 1000UL);
 }
 
 
-/**
- * @brief 
- * @param
- */
-void timer_sleep_us(uint32_t u_seg) {
-	timer_sleep_ms(u_seg / 1000);
+/*  Funciones de timeout y periódicas  */
+
+/* Estado de cada canal del temporizador */
+/* Función a ejecutar (0 -> canal libre) */
+static void (*volatile funciones[TIMER_NUM_CANALES])(void); 
+/* Periodo en ticks (0 -> es un timeout) */
+static volatile uint32_t periodos[TIMER_NUM_CANALES]; 
+/* Ticks que faltan tras el disparo programado */
+static volatile uint32_t ticks_restantes[TIMER_NUM_CANALES]; 
+
+
+/* Programa en el canal n el siguiente tramo de la espera, a partir del
+   valor actual de TCn. Como TCn es de 16 bits, las esperas largas se
+   dividen en tramos, todos de al menos margen_ticks.
+   Se debe invocar con las interrupciones enmascaradas */
+static void programa_tramo(uint8_t n) {
+  uint32_t restantes = ticks_restantes[n];
+  uint16_t tramo;
+
+  if (restantes >= (0x10000UL + margen_ticks)) {
+    /* Vuelta entera: TCn no cambia */
+    tramo = 0;
+    restantes -= 0x10000UL;
+  } else if (restantes > 0xFFFFUL) {
+    /* Con una vuelta entera quedaría un tramo final demasiado corto */
+    tramo = 0x8000;
+    restantes -= 0x8000UL;
+  } else {
+    /* Último tramo */
+    tramo = restantes;
+    restantes = 0;
+  }
+  TIMER_TC(n) += tramo;
+  ticks_restantes[n] = restantes;
 }
 
-
-/**
- * @brief Función para configurar un temporizador que ejecute una función 
- *        después de un tiempo determinado
- *        Se ejecutará una sola vez, y se desactivará automáticamente 
- *        después de ejecutarse
- * @param u_seg
- * @param ptFuncion
- */
-void timer_set_timeout(uint32_t u_seg, void (*ptFuncion)(void)) {
-  //time_out
-  uint32_t time_out = usg_2_ticks(u_seg);
-
-  // Calcular cuándo se debe ejecutar  
-  tiempo_inicio = timer_get_ticks() + time_out;
-
-  // Bloquear las interrupciones
-  lock();
-
-  // Guardar la función que queremos ejecutar
-  punteroFuncion = ptFuncion;
-
-  // Indicar que es una función de timeout, no periódica
-  tiempo_periodico = 0;
-
-  // Guardar el número de vueltas pendientes
-  vueltas_pendientes = time_out >> 16;
-
-  // Configurar el tiempo de disparo. TC2 tiene 16 bits, así que se usan 
-  // los 16 bits menos significativos de tiempo_inicio.
-  _IO_PORTS_W(M6812_TC2) = tiempo_inicio & 0xFFFF;
-
-  // Volver a habilitar las interrupciones
-  // Habilitar la interrupción del canal OC2
-  _io_ports[M6812_TMSK1] |= M6812B_C2I;
-
-  // Limpiar la bandera de interrupción del canal OC2
-  _io_ports[M6812_TFLG1] = M6812B_C2F;
-  unlock();
+/* Deja libre el canal n. Con las interrupciones enmascaradas */
+static void libera_canal(uint8_t n) {
+  /* Enmascaramos su interrupción */
+  _io_ports[M6812_TMSK1] &= (uint8_t)~TIMER_BIT(n);
+  _io_ports[M6812_TFLG1] = TIMER_BIT(n);   /* Bajamos el banderín */
+  funciones[n] = 0;
+  periodos[n] = 0;
+  ticks_restantes[n] = 0;
 }
 
+/* Tratamiento común de la interrupción del canal n */
+static void atiende_canal(uint8_t n) {
+  void (*funcion)(void) = funciones[n];
 
-/**
- * @brief
- * @param u_seg
- * @param ptFuncion
- */
-void timer_set_periodic(uint32_t u_seg, void (*ptFuncion)(void)) {
-  // Guardar el periodo en milisegundos
-  tiempo_periodico = usg_2_ticks(u_seg);
+  /* Bajamos el banderín del canal */
+  _io_ports[M6812_TFLG1] = TIMER_BIT(n);
 
-  // Guardar el tiempo de inicio
-  tiempo_inicio = timer_get_ticks() + tiempo_periodico;
-
-  // Bloquear las interrupciones
-  lock();
-
-  // Guardar la función que queremos ejecutar
-  punteroFuncion = ptFuncion;
-  
-  // Guardar el número de vueltas pendientes
-  vueltas_pendientes = tiempo_periodico >> 16;
-  _IO_PORTS_W(M6812_TC2) = _IO_PORTS_W(M6812_TCNT) + tiempo_periodico; 
-
-  // Configurar el temporizador para que genere interrupciones periódicas
-  // Limpiar la bandera de interrupción del canal OC2
-  _io_ports[M6812_TFLG1] = M6812B_C2F;
-
-  // Habilitar la interrupción del canal OC2
-  _io_ports[M6812_TMSK1] |= M6812B_C2I;
-  
-  // Configurar el tiempo de disparo
-  unlock();
-}
-
-
-/**
- * @brief Función para detener la ejecución periódica configurada con 
- *        timer_set_periodic Si no hay ninguna función periódica activa 
- *        no hace nada (así no se cancela un posible timeout pendiente)
- */
-void timer_stop_periodic(void) {
-  lock(); // Bloquear las interrupciones
-  if (tiempo_periodico > 0) {
-    // Deshabilitar la interrupción canal OC2  
-    _io_ports[M6812_TMSK1] &= ~M6812B_C2I; 
-
-    // Limpiar la bandera del canal OC2
-    _io_ports[M6812_TFLG1] = M6812B_C2F;
-
-    // Ya no hay función periódica
-    tiempo_periodico = 0;   
-
-    // Descartar vueltas pendientes
-    vueltas_pendientes = 0; 
-
-    // Ninguna función pendiente de ejecutar
-    punteroFuncion = 0;     
+  if (!funcion) {
+    /* No debería ocurrir: canal libre con la interrupción habilitada */
+    _io_ports[M6812_TMSK1] &= (uint8_t)~TIMER_BIT(n);
+    return;
   }
 
-  // Volver a habilitar las interrupciones
-  unlock(); 
+  if (ticks_restantes[n]) {
+    /* Aún no ha pasado todo el tiempo: siguiente tramo */
+    programa_tramo(n);
+    return;
+  }
+
+  if (periodos[n]) {
+    /* Periódica: programamos el siguiente disparo respecto al actual
+       (antes de ejecutar la función, para no depender de lo que tarde) */
+    ticks_restantes[n] = periodos[n];
+    programa_tramo(n);
+  } else {
+    /* Timeout: el canal queda libre antes de ejecutar la función, por si
+       ésta quiere programar otro timeout */
+    libera_canal(n);
+  }
+
+  funcion();
+}
+
+/* Rutinas de tratamiento de interrupción de cada canal */
+void __attribute__((interrupt)) vi_ioc0(void) { 
+  atiende_canal(0); 
+}
+
+#if TIMER_NUM_CANALES > 1
+void __attribute__((interrupt)) vi_ioc1(void) { 
+  atiende_canal(1); 
+}
+#endif
+
+#if TIMER_NUM_CANALES > 2
+void __attribute__((interrupt)) vi_ioc2(void) { 
+  atiende_canal(2); 
+}
+#endif
+#if TIMER_NUM_CANALES > 3
+void __attribute__((interrupt)) vi_ioc3(void) {
+  atiende_canal(3);
+}
+#endif
+
+#if TIMER_NUM_CANALES > 4
+void __attribute__((interrupt)) vi_ioc4(void) {
+  atiende_canal(4);
+}
+#endif
+
+#if TIMER_NUM_CANALES > 5
+void __attribute__((interrupt)) vi_ioc5(void) {
+  atiende_canal(5);
+}
+#endif
+
+#if TIMER_NUM_CANALES > 6
+void __attribute__((interrupt)) vi_ioc6(void) {
+  atiende_canal(6);
+}
+#endif
+
+#if TIMER_NUM_CANALES > 7
+void __attribute__((interrupt)) vi_ioc7(void) {
+  atiende_canal(7);
+}
+#endif
+
+/* Busca un canal libre y programa en él la función indicada.
+   si periodica no es 0 se repite cada useg; si no, se ejecuta una vez.
+   Devuelve el canal utilizado o TIMER_ERROR */
+static uint8_t programa_funcion(uint32_t useg, void (*ptFuncion)(void),
+                                uint8_t periodica) {
+  uint8_t n;
+  uint32_t ticks;
+  unsigned short mascara;
+
+  if (!ptFuncion)
+    return TIMER_ERROR;
+
+  ticks = usg_2_ticks(useg);
+  if (ticks < margen_ticks)
+    ticks = margen_ticks;
+
+  mascara = lock();
+
+  for (n = 0; n < TIMER_NUM_CANALES; n++)
+    if (!funciones[n])
+      break;
+  if (n == TIMER_NUM_CANALES) {
+    restore(mascara);
+    return TIMER_ERROR;
+  }
+
+  funciones[n] = ptFuncion;
+  periodos[n] = periodica ? ticks : 0;
+  ticks_restantes[n] = ticks;
+
+  /* Desconectamos el canal de su pin para no afectarlo
+     (canales 0 a 3 en TCTL2, canales 4 a 7 en TCTL1) */
+  if (n < 4)
+    _io_ports[M6812_TCTL2] &= (uint8_t)~(3 << (n << 1));
+  else
+    _io_ports[M6812_TCTL1] &= (uint8_t)~(3 << ((n - 4) << 1));
+  /* Configuramos el canal como comparador de salida */
+  _io_ports[M6812_TIOS] |= TIMER_BIT(n);
+
+  /* El tiempo se cuenta desde el valor actual de TCNT */
+  TIMER_TC(n) = _IO_PORTS_W(M6812_TCNT);
+  programa_tramo(n);
+
+  _io_ports[M6812_TFLG1] = TIMER_BIT(n);  /* Bajamos el banderín */
+  _io_ports[M6812_TMSK1] |= TIMER_BIT(n); /* Habilitamos su interrupción */
+
+  restore(mascara);
+  return n;
+}
+
+/* Libera el canal id si está ocupado por una función del tipo indicado */
+static void cancela_funcion(uint8_t id, uint8_t periodica) {
+  unsigned short mascara;
+
+  if (id >= TIMER_NUM_CANALES)
+    return;
+
+  mascara = lock();
+  if (funciones[id] && ((periodos[id] != 0) == (periodica != 0)))
+    libera_canal(id);
+  restore(mascara);
+}
+
+uint8_t timer_set_timeout(uint32_t useg, void (*ptFuncion)(void)) {
+  return programa_funcion(useg, ptFuncion, 0);
+}
+
+void timer_cancel_timeout(uint8_t id) {
+  cancela_funcion(id, 0);
+}
+
+uint8_t timer_set_periodic(uint32_t useg, void (*ptFuncion)(void)) {
+  return programa_funcion(useg, ptFuncion, 1);
+}
+
+void timer_stop_periodic(uint8_t id) {
+  cancela_funcion(id, 1);
+}
+
+
+/*  Inicialización  */
+
+void timer_init(uint8_t factor) {
+  uint8_t n;
+
+  /* Enmascaramos las interrupciones mientras se configura */
+  lock();
+
+  factor_tcm = factor & 0x07;
+  margen_ticks = (TIMER_MARGEN_CICLOS >> factor_tcm) + 2;
+
+  /* Establecemos el factor de división en TMSK2 y desactivamos
+     el reset de TCNT con el canal 7, respetando el resto de bits */
+  _io_ports[M6812_TMSK2] =
+      (_io_ports[M6812_TMSK2] & ~(M6812B_TCRE | 0x07)) | factor_tcm;
+
+  /* Los banderines se bajan escribiendo un 1, no al leer */
+  _io_ports[M6812_TSCR] &= ~M6812B_TFFCA;
+
+  /* Todos los canales de la librería libres y sin interrupción */
+  _io_ports[M6812_TMSK1] &= (uint8_t)~TIMER_BITS_CANALES;
+  _io_ports[M6812_TFLG1] = TIMER_BITS_CANALES;
+  for (n = 0; n < TIMER_NUM_CANALES; n++) {
+    funciones[n] = 0;
+    periodos[n] = 0;
+    ticks_restantes[n] = 0;
+  }
+
+  /* Arrancamos el temporizador */
+  _io_ports[M6812_TSCR] |= M6812B_TEN;
+
+  /* Origen de tiempos: 0 vueltas y el valor actual de TCNT. Si TCNT
+     desborda justo entre bajar el banderín y leerlo, se repite para que
+     esa vuelta no se cuente de más */
+  numero_vueltas = 0;
+  do {
+    _io_ports[M6812_TFLG2] = M6812B_TOF;
+    tcnt_inicio = _IO_PORTS_W(M6812_TCNT);
+  } while (_io_ports[M6812_TFLG2] & M6812B_TOF);
+
+  /* Habilitamos la interrupción de desbordamiento */
+  _io_ports[M6812_TMSK2] |= M6812B_TOI;
+
+  /* Habilitamos las interrupciones */
+  unlock();
 }
