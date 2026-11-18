@@ -289,12 +289,9 @@ static uint8_t programa_funcion(uint32_t useg, void (*ptFuncion)(void),
   periodos[n] = periodica ? ticks : 0;
   ticks_restantes[n] = ticks;
 
-  /* Desconectamos el canal de su pin para no afectarlo
-     (canales 0 a 3 en TCTL2, canales 4 a 7 en TCTL1) */
-  if (n < 4)
-    _io_ports[M6812_TCTL2] &= (uint8_t)~(3 << (n << 1));
-  else
-    _io_ports[M6812_TCTL1] &= (uint8_t)~(3 << ((n - 4) << 1));
+  /* Ningún canal de la librería toca su patilla */
+  _io_ports[M6812_TCTL2] = 0;   /* canales 0 a 3 */
+  _io_ports[M6812_TCTL1] = 0;   /* canales 4 a 7 */
   /* Configuramos el canal como comparador de salida */
   _io_ports[M6812_TIOS] |= TIMER_BIT(n);
 
